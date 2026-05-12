@@ -6,7 +6,7 @@ import time
 import pandas
 import pyarrow
 from concurrent.futures import ThreadPoolExecutor
-from automap_hxn.analysis import analyze_data_from_arrays
+#from automap_hxn.analysis import analyze_data_from_arrays
 import numpy as np
 from pathlib import Path
 import torch
@@ -133,14 +133,15 @@ def stitch_instances(binary_vol: np.ndarray, min_voxels: int) -> np.ndarray:
 # visualization helpers removed — no matplotlib usage required in receiver
 
 
-URI_IN = os.getenv("URI_IN", "https://tiled.nsls2.bnl.gov/api/v1/metadata/tst/sandbox/eugene/synaps/reconstructions")
-URI_OUT = os.getenv("URI_OUT", "https://tiled.nsls2.bnl.gov/api/v1/metadata/tst/sandbox/eugene/synaps/segmentations")
+URI_IN = os.getenv("URI_IN", "https://tiled.nsls2.bnl.gov/api/v1/metadata/hxn/processed/reconstructions")
+URI_OUT = os.getenv("URI_OUT", "https://tiled.nsls2.bnl.gov/api/v1/metadata/hxn/processed/segmentations")
 
 # Cache metadata updates to match them with subsequent data updates.
 METADATA_UPDATES = {}
 SUBSCRIPTIONS = []
 
-writer_client = from_uri(URI_OUT)
+api_key = os.getenv("API_KEY")
+writer_client = from_uri(URI_OUT, api_key=api_key)
 executor = ThreadPoolExecutor(max_workers=4)
 
 def segmentation_function(data, metadata, path_parts):
@@ -282,7 +283,7 @@ def run_segmentation(update: LiveArrayData):
 
 # To run the function:
 if __name__ == "__main__":
-    client = from_uri(URI_IN)
+    client = from_uri(URI_IN, api_key=api_key)
     sub = client.subscribe()
     sub.child_created.add_callback(on_new_dataset)
     print("📡 Listening for updates. Use Ctrl+C to stop....", flush=True)
