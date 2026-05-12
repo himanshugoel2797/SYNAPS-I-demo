@@ -16,10 +16,10 @@ from sam3.model.sam3_image_processor import Sam3Processor
 
 
 AXES = {"xy": 0, "xz": 1, "yz": 2}
-DEFAULT_CKPT = Path(__file__).parent.parent / "runs/ibm_pcm_ft_rich_prompts/checkpoints/checkpoint.pt"
+DEFAULT_CKPT = Path(__file__).parent.parent / "sam3/runs/ibm_pcm_ft_rich_prompts/checkpoints/checkpoint.pt"
 DEFAULT_VOTE_THRESHOLD = 2
 DEFAULT_TEXT_PROMPT = "IC feature"
-DEFAULT_MIN_COMPONENT_VOXELS = 50
+DEFAULT_MIN_COMPONENT_VOXELS = 15
 CONF_THRESH = 0.3
 NORM_LO_PCT, NORM_HI_PCT = 1.0, 99.9
 
@@ -121,6 +121,43 @@ def stitch_instances(binary_vol: np.ndarray, min_voxels: int) -> np.ndarray:
     return labels
 
 
+def make_thumbnail(labels: np.ndarray, max_side: int = 512) -> np.ndarray:
+    """Fast grayscale isometric-ish thumbnail from a 3-D label volume.
+
+    Three binary max-projections (top / front / side) are arranged into a
+    single L-shaped composite image.  All work is three np.max calls plus
+    array slicing – no interpolation or rotation.
+
+    Layout (nz = depth, ny = height, nx = width)::
+
+        +--------+--------+
+        | (empty)| top    |  <- looking down  (ny × nx)
+        +--------+--------+
+        | side   | front  |  <- side (nz × ny)  front (nz × nx)
+        +--------+--------+
+    """
+    binary = (labels > 0).astype(np.uint8)  # 0/1, shape (nz, ny, nx)
+    nz, ny, nx = binary.shape
+    top   = binary.max(axis=0)              # (ny, nx)  – looking down
+    front = binary.max(axis=1)              # (nz, nx)  – looking from front
+    side  = binary.max(axis=2)              # (nz, ny)  – looking from side
+
+    canvas = np.zeros((ny + nz, ny + nx), dtype=np.uint8)
+    canvas[:ny, ny:]  = top    # upper-right
+    canvas[ny:, :ny]  = side   # lower-left
+    canvas[ny:, ny:]  = front  # lower-right
+
+    # Nearest-neighbour downscale to max_side (pure numpy, no PIL)
+    h, w = canvas.shape
+    scale = max_side / max(h, w)
+    if scale < 1.0:
+        rr = (np.arange(int(h * scale)) * h // int(h * scale)).astype(np.intp)
+        cc = (np.arange(int(w * scale)) * w // int(w * scale)).astype(np.intp)
+        canvas = canvas[np.ix_(rr, cc)]
+
+    return (canvas * 255).astype(np.uint8)
+
+
 URI_IN = os.getenv("URI_IN", "https://tiled.nsls2.bnl.gov/api/v1/metadata/hxn/processed/reconstructions")
 URI_OUT = os.getenv("URI_OUT", "https://tiled.nsls2.bnl.gov/api/v1/metadata/hxn/processed/segmentations")
 
@@ -139,8 +176,8 @@ def segmentation_function(data, metadata, path_parts):
     dataset_name, _ = path_parts[-2:]
     try:
         container = writer_client[dataset_name]
-    except KeyError:
-        container = writer_client.create_container(dataset_name, access_tags=["tst_sandbox"])
+    except:
+        container = writer_client.create_container(dataset_name, access_tags=["synaps_project"])
 
     try:
         vol = np.asarray(data)
@@ -169,15 +206,22 @@ def segmentation_function(data, metadata, path_parts):
 
         for name, arr in per_axis.items():
             try:
-                container.write_array(arr.astype(np.uint8), key=f"pred_per_axis_{name}", access_tags=["tst_sandbox"])
+                container.write_array(arr.astype(np.uint8), key=f"pred_per_axis_{name}", access_tags=["synaps_project"])
             except Exception as e:
                 print(f"❌ Failed to write per-axis array {name}: {e}")
 
         try:
-            container.write_array(labels.astype(np.int32), key="pred_labels3d", access_tags=["tst_sandbox"])
+            container.write_array(labels.astype(np.int32), key="pred_labels3d", access_tags=["synaps_project"])
             print("✅ Uploaded predicted labels to Tiled as 'pred_labels3d'.")
         except Exception as e:
             print(f"❌ Failed to upload labeled volume: {e}")
+
+        try:
+            thumb = make_thumbnail(labels)
+            container.write_array(thumb, key="thumbnail", access_tags=["synaps_project"])
+            print(f"✅ Uploaded thumbnail to Tiled as 'thumbnail' ({thumb.shape[0]}×{thumb.shape[1]} px).")
+        except Exception as e:
+            print(f"❌ Failed to upload thumbnail: {e}")
 
         print(f"✅ SAM3 segmentation complete for dataset {dataset_name}: {int(labels.max())} instances.")
 
