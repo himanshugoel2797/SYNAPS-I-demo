@@ -15,8 +15,9 @@ from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
 
+ACCESS_TAG: str = "hxn_processed"
 AXES = {"xy": 0, "xz": 1, "yz": 2}
-DEFAULT_CKPT = Path(__file__).parent.parent / "sam3/runs/ibm_pcm_ft_rich_prompts/checkpoints/checkpoint.pt"
+DEFAULT_CKPT = "/nsls2/data2/hxn/legacy/home/home/SYNAPS/hgoel1/sam3/runs/ibm_pcm_ft_rich_prompts/checkpoints/checkpoint.pt"
 DEFAULT_VOTE_THRESHOLD = 2
 DEFAULT_TEXT_PROMPT = "IC feature"
 DEFAULT_MIN_COMPONENT_VOXELS = 15
@@ -161,13 +162,23 @@ def make_thumbnail(labels: np.ndarray, max_side: int = 512) -> np.ndarray:
 URI_IN = os.getenv("URI_IN", "https://tiled.nsls2.bnl.gov/api/v1/metadata/hxn/processed/reconstructions")
 URI_OUT = os.getenv("URI_OUT", "https://tiled.nsls2.bnl.gov/api/v1/metadata/hxn/processed/segmentations")
 
-# Cache metadata updates to match them with subsequent data updates.
 METADATA_UPDATES = {}
 SUBSCRIPTIONS = []
+PROCESSING = set()
 
 api_key = os.getenv("API_KEY")
+reader_client = from_uri(URI_IN, api_key=api_key)
 writer_client = from_uri(URI_OUT, api_key=api_key)
 executor = ThreadPoolExecutor(max_workers=4)
+
+
+def _on_future_done(dataset_name, future):
+    PROCESSING.discard(dataset_name)
+    exc = future.exception()
+    if exc is not None:
+        import traceback
+        print(f"❌ Exception in segmentation for {dataset_name}:")
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
 
 
 def segmentation_function(data, metadata, path_parts):
@@ -177,7 +188,7 @@ def segmentation_function(data, metadata, path_parts):
     try:
         container = writer_client[dataset_name]
     except:
-        container = writer_client.create_container(dataset_name, access_tags=["synaps_project"])
+        container = writer_client.create_container(dataset_name, access_tags=[ACCESS_TAG])
 
     try:
         vol = np.asarray(data)
@@ -185,7 +196,7 @@ def segmentation_function(data, metadata, path_parts):
         print(f"❌ Couldn't convert incoming data to ndarray: {e}")
         return
 
-    ckpt_path = Path(os.getenv("SAM_CKPT", str(DEFAULT_CKPT)))
+    ckpt_path = Path(os.getenv("SAM_CKPT", DEFAULT_CKPT))
     text_prompt = metadata.get("text_prompt", DEFAULT_TEXT_PROMPT)
     vote_threshold = int(float(metadata.get("vote_threshold", DEFAULT_VOTE_THRESHOLD)))
     min_component_voxels = int(float(metadata.get("min_component_voxels", DEFAULT_MIN_COMPONENT_VOXELS)))
@@ -206,19 +217,19 @@ def segmentation_function(data, metadata, path_parts):
 
         for name, arr in per_axis.items():
             try:
-                container.write_array(arr.astype(np.uint8), key=f"pred_per_axis_{name}", access_tags=["synaps_project"])
+                container.write_array(arr.astype(np.uint8), key=f"pred_per_axis_{name}", access_tags=[ACCESS_TAG])
             except Exception as e:
                 print(f"❌ Failed to write per-axis array {name}: {e}")
 
         try:
-            container.write_array(labels.astype(np.int32), key="pred_labels3d", access_tags=["synaps_project"])
+            container.write_array(labels.astype(np.int32), key="pred_labels3d", access_tags=[ACCESS_TAG])
             print("✅ Uploaded predicted labels to Tiled as 'pred_labels3d'.")
         except Exception as e:
             print(f"❌ Failed to upload labeled volume: {e}")
 
         try:
             thumb = make_thumbnail(labels)
-            container.write_array(thumb, key="thumbnail", access_tags=["synaps_project"])
+            container.write_array(thumb, key="thumbnail", access_tags=[ACCESS_TAG])
             print(f"✅ Uploaded thumbnail to Tiled as 'thumbnail' ({thumb.shape[0]}×{thumb.shape[1]} px).")
         except Exception as e:
             print(f"❌ Failed to upload thumbnail: {e}")
@@ -253,10 +264,20 @@ def on_new_array(update: LiveChildCreated):
 
 
 def run_segmentation(update: LiveArrayData):
-    "Runs when data is uploaded to the array. Metadata is retrieved from the cache and passed to the segmentation function."
+    "Runs when data is uploaded to the array. Read the full array from the server instead of using the streamed chunk."
     path_parts = tuple(update.subscription.segments)
+    dataset_name = path_parts[-2]
+
+    if dataset_name in PROCESSING:
+        print(f"⏭️ Skipping chunk event for {dataset_name} (already processing)")
+        return
+    PROCESSING.add(dataset_name)
+
     metadata = METADATA_UPDATES.get(path_parts[:-1], {})
-    executor.submit(segmentation_function, data=update.data(), metadata=metadata, path_parts=path_parts[-2:])
+    array_name = path_parts[-1]
+    data = np.asarray(reader_client[dataset_name][array_name].read())
+    future = executor.submit(segmentation_function, data=data, metadata=metadata, path_parts=path_parts[-2:])
+    future.add_done_callback(lambda f: _on_future_done(dataset_name, f))
 
 
 if __name__ == "__main__":
